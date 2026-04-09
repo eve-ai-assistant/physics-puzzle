@@ -169,7 +169,8 @@ function playTwang() {
 function playCrash() {
     if (audioCtx.state === 'suspended') return;
     let now = Date.now(); if (now - lastCrashTime < 100) return; lastCrashTime = now;
-    const bufSize = audioCtx.sampleRate * 0.2, buf = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
+    // FIX: Math.floor guarantees buffer sizes are explicitly mapped integers preventing floating point DOMExceptions
+    const bufSize = Math.floor(audioCtx.sampleRate * 0.2), buf = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
     const data = buf.getChannelData(0); for(let i=0; i<bufSize; i++) data[i] = Math.random() * 2 - 1;
     const noise = audioCtx.createBufferSource(), filter = audioCtx.createBiquadFilter(), gain = audioCtx.createGain();
     noise.buffer = buf; filter.type = 'lowpass'; filter.frequency.value = 600;
@@ -215,7 +216,10 @@ window.addEventListener('resize', resize); resize();
  *  MATTER.JS PHYSICS & ENTITIES
  *  ======================================================================= */
 const engine = Matter.Engine.create({ positionIterations: 16, velocityIterations: 16 });
-engine.world.gravity.y = 1.2;
+
+// FIX: Matter 0.19.0 compatibility standard for initializing engine gravity
+if (engine.gravity) engine.gravity.y = 1.2;
+else if (engine.world && engine.world.gravity) engine.world.gravity.y = 1.2;
 
 let gameState = 'MENU'; // MENU, LEVEL_SELECT, PLAYING, ENDED
 let turnState = 'IDLE'; // IDLE, AIMING, FLYING, SETTLING
@@ -232,12 +236,13 @@ function addBlock(x, y, w, h, type) {
     else if (type === 'glass') { opts.density = 0.001; opts.customColor = 'rgba(173, 216, 230, 0.5)'; }
     let b = Matter.Bodies.rectangle(x, y, w, h, opts);
     b.customWidth = w; b.customHeight = h;
-    Matter.World.add(engine.world, b);
+    b.customColor = opts.customColor; // Explicitly map color locally
+    Matter.Composite.add(engine.world, b); // Fixed deprecation (was World.add)
 }
 
 function addPig(x, y) {
     let b = Matter.Bodies.circle(x, y, 25, { density: 0.002, friction: 0.5, restitution: 0.4, label: 'pig' });
-    Matter.World.add(engine.world, b); targetsLeft++;
+    Matter.Composite.add(engine.world, b); targetsLeft++;
 }
 
 function spawnProjectile() {
@@ -245,7 +250,7 @@ function spawnProjectile() {
         density: 0.015, friction: 0.5, restitution: 0.4, frictionAir: 0, // 0 air friction = perfect trajectory mapping
         label: 'projectile', isBullet: true, isStatic: true
     });
-    Matter.World.add(engine.world, projectile);
+    Matter.Composite.add(engine.world, projectile);
 }
 
 /** =======================================================================
@@ -323,9 +328,13 @@ function loadLevel(i) {
     currentLevel = i; const lvl = LEVELS[i];
     projectiles = lvl.shots; targetsLeft = 0;
     
-    Matter.World.clear(engine.world); Matter.Engine.clear(engine);
+    // FIX CAUSE: Removed Matter.Engine.clear(engine).
+    // Clearing the engine corrupts the broadphase detector tracking arrays natively causing fatal game execution halts in 0.19.0.
+    // Calling Composite.clear(world) is entirely sufficient.
+    Matter.Composite.clear(engine.world);
+    
     particles = []; bodiesToRemove = []; bodiesToAdd = [];
-    Matter.World.add(engine.world, Matter.Bodies.rectangle(540, 1760, 2000, 320, { isStatic: true, label: 'ground', friction: 1.0 }));
+    Matter.Composite.add(engine.world, Matter.Bodies.rectangle(540, 1760, 2000, 320, { isStatic: true, label: 'ground', friction: 1.0 }));
     
     lvl.build(); spawnProjectile(); updateHUD();
     gameState = 'PLAYING'; turnState = 'IDLE';
@@ -441,7 +450,8 @@ Matter.Events.on(engine, 'afterUpdate', () => {
         if (b.position.y > 2100 || b.position.x < -500 || b.position.x > 1580) {
             if (!bodiesToRemove.includes(b)) { b.isDestroyed = true; bodiesToRemove.push(b); }
         }
-        if (b.label === 'debris') { b.life = (b.life || 180) - 1; if (b.life <= 0 && !bodiesToRemove.includes(b)) bodiesToRemove.push(b); }
+        // FIX: Replaced `|| 180` to safely catch logical 0 values rendering debris indestructible
+        if (b.label === 'debris') { b.life = (b.life === undefined ? 180 : b.life) - 1; if (b.life <= 0 && !bodiesToRemove.includes(b)) bodiesToRemove.push(b); }
     });
 
     if (bodiesToRemove.length > 0) {
@@ -572,15 +582,27 @@ function render(time) {
             ctx.restore(); return;
         }
         
-        ctx.fillStyle = body.customColor || '#FFF';
+        // FIX: Safer string fallbacks to avoid unhandled TypeErrors from missing or corrupted labels during rendering loops
+        let label = body.label || '';
+        let customColor = body.customColor || '';
+        
+        ctx.fillStyle = customColor || '#FFF';
         ctx.beginPath(); body.vertices.forEach((v, i) => { if (i===0) ctx.moveTo(v.x, v.y); else ctx.lineTo(v.x, v.y); });
         ctx.closePath(); ctx.fill();
         
-        if (body.label === 'glass' || (body.label === 'debris' && body.customColor.includes('173'))) {
+        if (label === 'glass' || (label === 'debris' && customColor.includes('173'))) {
             ctx.strokeStyle = 'rgba(255,255,255,0.8)'; ctx.lineWidth = 3; ctx.stroke();
             ctx.save(); ctx.clip(); ctx.fillStyle = 'rgba(255,255,255,0.3)';
-            ctx.beginPath(); ctx.moveTo(body.vertices[0].x, body.vertices[0].y); ctx.lineTo(body.vertices[1].x, body.vertices[1].y); ctx.lineTo(body.vertices[1].x, body.vertices[1].y + 15); ctx.lineTo(body.vertices[0].x, body.vertices[0].y + 15); ctx.fill(); ctx.restore();
-        } else if (!body.label.includes('debris')) {
+            if (body.vertices && body.vertices.length >= 4) {
+                ctx.beginPath(); 
+                ctx.moveTo(body.vertices[0].x, body.vertices[0].y); 
+                ctx.lineTo(body.vertices[1].x, body.vertices[1].y); 
+                ctx.lineTo(body.vertices[1].x, body.vertices[1].y + 15); 
+                ctx.lineTo(body.vertices[0].x, body.vertices[0].y + 15); 
+                ctx.fill(); 
+            }
+            ctx.restore();
+        } else if (!label.includes('debris')) {
             ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.lineWidth = 2; ctx.stroke();
         }
     });
